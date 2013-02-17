@@ -1,16 +1,13 @@
 {-# LANGUAGE BangPatterns, NamedFieldPuns#-}
-module SafeHash where
+module SafeHash(HashTable(), new, new_, new', new_', htInsert, htDelete, htLookup, fromList, toList, mapReduce) where
 
 import Control.Concurrent.STM.TArray
 import Control.Concurrent.STM.TVar
 import Control.Monad
 import Control.Monad.STM
-import Data.Array.IO
 import Data.Array.MArray
-import Data.IORef
 import Data.Maybe
 import Data.Word
-import GHC.Conc.Sync
 
 minTableSize = 8 :: Word32
 extensionSize = 10 :: Word32
@@ -40,13 +37,25 @@ htInsert ht k v = atomically $ htInsert' ht k v
 htInsert' :: HashTable key val -> key -> val -> STM ()
 htInsert' (ht@HashTable{hash, table=ref}) k v = do
        iht@HT{usage, buckets} <- readTVar ref
-       (0, size) <- getBounds $ buckets
+       (0, size) <- getBounds buckets
        when (tooBig usage size) (rehash ht)
-       (0, size') <- getBounds $ buckets
+       (0, size') <- getBounds buckets
        let indx = (hash k) `mod` size'
        bucket <- readArray buckets indx
        writeArray buckets indx ((k, v):bucket)
        writeTVar ref (iht{usage=usage+1})
+
+htDelete :: HashTable key val -> key -> IO ()
+htDelete table k = atomically $ htDelete' table k
+
+htDelete' :: HashTable key val -> key -> STM ()
+htDelete' (ht@HashTable{cmp, hash, table=ref}) k = do
+                                          HT{buckets} <- readTVar ref
+                                          (0, size) <- getBounds buckets
+                                          let indx = (hash k) `mod` size
+                                          bucket <- readArray buckets indx
+                                          writeArray buckets indx (filter (not . cmp k . fst) bucket)
+                
 
 htLookup :: HashTable key val -> key -> IO (Maybe val)
 htLookup ht k = atomically $ htLookup' ht k
@@ -54,7 +63,7 @@ htLookup ht k = atomically $ htLookup' ht k
 htLookup' :: HashTable key val -> key -> STM (Maybe val)
 htLookup' ht@HashTable{cmp, hash, table=ref} k = do
                                           HT{buckets} <- readTVar ref
-                                          (0, size) <- getBounds $ buckets
+                                          (0, size) <- getBounds buckets
                                           let indx = (hash k) `mod` size
                                           fmap (fmap snd . listToMaybe . filter (cmp k . fst)) (readArray buckets indx)
 
@@ -64,7 +73,7 @@ tooBig usage size = usage > 7 * size + 64
 rehash :: HashTable key val -> STM ()
 rehash ht@HashTable{cmp, hash, table=ref} = do
                                           HT{buckets=buckets} <- readTVar ref
-                                          (0, size) <- getBounds $ buckets
+                                          (0, size) <- getBounds buckets
                                           if size <= maxBound - extensionSize
                                           then do
                                                kvs <- fmap concat (getElems buckets)
