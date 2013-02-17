@@ -1,0 +1,4 @@
+SafeHash
+========
+
+thread safe hashtable
