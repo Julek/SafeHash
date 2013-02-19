@@ -1,5 +1,5 @@
 {-# LANGUAGE BangPatterns, NamedFieldPuns#-}
-module SafeHash(HashTable(), new, new_, new', new_', htInsert, htDelete, htLookup, fromList, toList, mapReduce) where
+module Data.SafeHash(HashTable(), HashTableConfig(HTC), newOrd, new, newOrd', new', newOrdHint, newHint, newOrdHint', newHint', defaultTableConfig, htInsert, htDelete, htLookup, fromList, fromList', fromListOrd, fromListOrd', fromListOrdHint, fromListOrdHint', toList, mapReduce) where
 
 import Control.Concurrent.STM.TArray
 import Control.Concurrent.STM.TVar
@@ -10,40 +10,51 @@ import Data.Maybe
 import Data.Word
 
 minTableSize = 8 :: Word32
-extensionSize = 10 :: Word32
+defaultExtensionSize = 10 :: Word32
+defaultTableConfig = HTC{tableSize = minTableSize, extensionSize=defaultExtensionSize} :: HashTableConfig
 
 data HashTable key val = HashTable {cmp :: !(key -> key -> Ordering), hash :: !(key -> Word32), table :: TVar (HT key val)}
 data HT key val = HT {usage :: !Word32, eSize :: !Word32, buckets :: !(TArray Word32 (Tree key val))}
+data HashTableConfig = HTC {tableSize :: Word32, extensionSize :: Word32}
 data Tree key val = Node key val (Tree key val) (Tree key val) | Leef
 
 newOrd :: Ord key => (key -> Word32) -> IO (HashTable key val)
-newOrd = new_ compare
+newOrd hash = newInternal compare hash minTableSize defaultExtensionSize
 
 new :: Eq key => (key -> Word32) -> IO (HashTable key val)
-new = new_ eqCompare
+new hash = newInternal eqCompare hash minTableSize defaultExtensionSize
 
-new_ :: (key -> key -> Ordering) -> (key -> Word32) -> IO (HashTable key val)
-new_ cmp hash = new_' cmp hash minTableSize
+newOrd' :: (key -> key -> Ordering) -> (key -> Word32) -> IO (HashTable key val)
+newOrd' cmp hash = newInternal cmp hash minTableSize defaultExtensionSize
 
-new' :: (Eq key) => (key -> Word32) -> Word32 -> IO (HashTable key val)
-new' hash size = new_' (makeCompare (==)) hash size
+new' :: (key -> key -> Bool) -> (key -> Word32) -> IO (HashTable key val)
+new' cmp hash = newInternal (makeCompare cmp) hash minTableSize defaultExtensionSize
 
-new_' :: (key -> key -> Ordering) -> (key -> Word32) -> Word32 -> IO (HashTable key val)
-new_' cmp hash size = newWithExtensionSize_' cmp hash size extensionSize
+newOrdHint :: Ord key => (key -> Word32) -> HashTableConfig -> IO (HashTable key val)
+newOrdHint hash HTC{tableSize, extensionSize} = newInternal compare hash tableSize extensionSize
 
+newHint :: Eq key => (key -> Word32) -> HashTableConfig -> IO (HashTable key val)
+newHint hash HTC{tableSize, extensionSize} = newInternal eqCompare hash tableSize extensionSize
 
-newWithExtensionSize_' :: (key -> key -> Ordering) -> (key -> Word32) -> Word32 -> Word32 -> IO (HashTable key val)
-newWithExtensionSize_' cmp hash size eSize = do
+newOrdHint' :: (key -> key -> Ordering) -> (key -> Word32) -> HashTableConfig -> IO (HashTable key val)
+newOrdHint' cmp hash HTC{tableSize, extensionSize} = newInternal cmp hash tableSize extensionSize
+
+newHint' :: (key -> key -> Bool) -> (key -> Word32) -> HashTableConfig -> IO (HashTable key val)
+newHint' cmp hash HTC{tableSize, extensionSize} = newInternal (makeCompare cmp) hash tableSize extensionSize
+
+--                  compare function        hash function      size    extension
+newInternal :: (key -> key -> Ordering) -> (key -> Word32) -> Word32 -> Word32 -> IO (HashTable key val)
+newInternal cmp hash size eSize = do
      buckets <- atomically $ newArray (0, size-1) Leef
      let table = HT {usage = 0, eSize = eSize, buckets=buckets}
      ref <- newTVarIO table
      return (HashTable {cmp=cmp, hash=hash, table=ref})
 
 htInsert :: HashTable key val -> key -> val -> IO ()
-htInsert ht k v = atomically $ htInsert' ht k v
+htInsert ht k v = atomically $ htInsert_ ht k v
 
-htInsert' :: HashTable key val -> key -> val -> STM ()
-htInsert' (ht@HashTable{cmp, hash, table=ref}) k v = do
+htInsert_ :: HashTable key val -> key -> val -> STM ()
+htInsert_ (ht@HashTable{cmp, hash, table=ref}) k v = do
        iht@HT{usage, buckets} <- readTVar ref
        (0, size) <- getBounds buckets
        when (tooBig usage size) (rehash ht)
@@ -54,22 +65,21 @@ htInsert' (ht@HashTable{cmp, hash, table=ref}) k v = do
        writeTVar ref (iht{usage=usage+1})
 
 htDelete :: HashTable key val -> key -> IO ()
-htDelete table k = atomically $ htDelete' table k
+htDelete table k = atomically $ htDelete_ table k
 
-htDelete' :: HashTable key val -> key -> STM ()
-htDelete' (ht@HashTable{cmp, hash, table=ref}) k = do
+htDelete_ :: HashTable key val -> key -> STM ()
+htDelete_ (ht@HashTable{cmp, hash, table=ref}) k = do
                                           HT{buckets} <- readTVar ref
                                           (0, size) <- getBounds buckets
                                           let indx = (hash k) `mod` size
                                           bucket <- readArray buckets indx
                                           writeArray buckets indx (tDelete cmp bucket k)
                 
-
 htLookup :: HashTable key val -> key -> IO (Maybe val)
-htLookup ht k = atomically $ htLookup' ht k
+htLookup ht k = atomically $ htLookup_ ht k
 
-htLookup' :: HashTable key val -> key -> STM (Maybe val)
-htLookup' ht@HashTable{cmp, hash, table=ref} k = do
+htLookup_ :: HashTable key val -> key -> STM (Maybe val)
+htLookup_ ht@HashTable{cmp, hash, table=ref} k = do
                                           HT{buckets} <- readTVar ref
                                           (0, size) <- getBounds buckets
                                           let indx = (hash k) `mod` size
@@ -82,13 +92,11 @@ rehash :: HashTable key val -> STM ()
 rehash ht@HashTable{cmp, hash, table=ref} = do
                                           HT{buckets, eSize} <- readTVar ref
                                           (0, size) <- getBounds buckets
-                                          if size <= maxBound - eSize
-                                          then do
+                                          when (size <= maxBound - eSize) $ do
                                                kvs <- fmap (concat . map tCollapse) (getElems buckets)
                                                buckets' <- newArray (0, size + eSize) Leef
                                                writeTVar ref (HT {usage = 0, eSize = eSize, buckets=buckets'})
-                                               mapM_ (uncurry $ htInsert' ht) kvs
-                                          else return ()
+                                               mapM_ (uncurry $ htInsert_ ht) kvs
 
 fromList :: (Eq key) => (key -> Word32) -> [(key, val)] -> IO (HashTable key val)
 fromList = fromList' (==)
@@ -105,23 +113,33 @@ fromListOrd' cmp hash ls = do
               sz = if sz' < minTableSize
                        then sz'
                        else minTableSize
-          ret <- new_' cmp hash sz'
+          ret <- newOrdHint' cmp hash (defaultTableConfig{tableSize = sz})
           mapM_ (uncurry $ htInsert ret) ls
           return ret
 
-toList :: HashTable key val -> IO [(key, val)]
-toList = atomically . toList'
+fromListOrdHint :: (Ord key) => (key -> Word32) -> HashTableConfig -> [(key, val)] -> IO (HashTable key val)
+fromListOrdHint hash conf ls = fromListOrdHint' compare hash conf ls
 
-toList' :: HashTable key val -> STM [(key, val)]
-toList' HashTable{table=ref} = do
+fromListOrdHint' :: (key -> key -> Ordering) -> (key -> Word32) -> HashTableConfig -> [(key, val)] -> IO (HashTable key val)
+fromListOrdHint' cmp hash conf ls = do
+                            ret <- newOrdHint' cmp hash conf
+                            mapM_ (uncurry $ htInsert ret) ls
+                            return ret
+
+
+toList :: HashTable key val -> IO [(key, val)]
+toList = atomically . toList_
+
+toList_ :: HashTable key val -> STM [(key, val)]
+toList_ HashTable{table=ref} = do
                             HT{buckets=buckets} <- readTVar ref
                             fmap (concat . map (tCollapse . snd)) . getAssocs $ buckets
                             
 mapReduce :: ((key, val) -> r) -> ([r] -> r) -> HashTable key val -> IO r
-mapReduce m r table = atomically $ mapReduce' m r table
-                                 
-mapReduce' :: ((key, val) -> r) -> ([r] -> r) -> HashTable key val -> STM r
-mapReduce' m r table = fmap (r . map m) (toList' table)
+mapReduce m r table = atomically $ mapReduce_ m r table
+
+mapReduce_ :: ((key, val) -> r) -> ([r] -> r) -> HashTable key val -> STM r
+mapReduce_ m r table = fmap (r . map m) (toList_ table)
 
 -- Sorted Binary Key Value Association Trees
 
@@ -134,14 +152,18 @@ tInsert cmp Leef k v = Node k v Leef Leef
 tInsert cmp (Node k' v' t1 t2) k v = case cmp k' k of
                  LT -> Node k' v' (tInsert cmp t1 k v) t2
                  GT -> Node k' v' t1 (tInsert cmp t2 k v)
-                 otherwise -> Node k' v t1 t2
+                 EQ -> Node k' v t1 t2
 
 tDelete :: (key -> key -> Ordering) -> Tree key val -> key -> Tree key val
 tDelete cmp Leef k = Leef
-tDelete cmp (Node k' v t1 t2) k = case cmp k' k of
-           LT -> Node k' v (tDelete cmp t1 k) t2
-           GT -> Node k' v t1 (tDelete cmp t2 k)
-           otherwise -> undefined
+tDelete cmp (Node k' v' t1 t2) k = case cmp k' k of
+           LT -> Node k' v' (tDelete cmp t1 k) t2
+           GT -> Node k' v' t1 (tDelete cmp t2 k)
+           EQ -> insertLeftMost t2 t1
+
+insertLeftMost :: Tree key val -> Tree key val -> Tree key val
+insertLeftMost Leef i = i
+insertLeftMost (Node k v t1 t2) i = Node k v (insertLeftMost t1 i) t2
 
 tLookup :: (key -> key -> Ordering) -> Tree key val -> key -> Maybe val
 tLookup cmp Leef k = Nothing

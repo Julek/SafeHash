@@ -1,4 +1,0 @@
-SafeHash
-========
-
-thread safe hashtable
